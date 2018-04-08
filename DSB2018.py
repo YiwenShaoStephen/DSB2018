@@ -1,28 +1,33 @@
+import sys
 import argparse
 import os
 import shutil
+import torchvision
+import random
+import PIL
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import torch as t
 from torchvision import transforms as tsf
-from pathlib import Path
-from skimage import io
-import PIL
-from models.Unet_naive import UNet
+from skimage.io import imread
+from models.Unet import UNet
 from skimage.transform import resize
 from skimage.morphology import label
+from tensorboard_logger import configure, log_value
 
-TRAIN_PATH = './train.pth.tar'
-TEST_PATH = './test.pth.tar'
 
 parser = argparse.ArgumentParser(description='Pytorch DSB2018 setup')
 parser.add_argument('--epochs', default=10, type=int,
                     help='number of total epochs to run')
-parser.add_argument('--print-freq', '-p', default=5, type=int,
-                    help='print frequency (default: 5)')
-parser.add_argument('-b', '--batch-size', default=32, type=int,
-                    help='mini-batch size (default: 32)')
+parser.add_argument('--start-epoch', default=0, type=int,
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('--resume', default='', type=str,
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--print-freq', '-p', default=10, type=int,
+                    help='print frequency (default: 10)')
+parser.add_argument('-b', '--batch-size', default=16, type=int,
+                    help='mini-batch size (default: 16)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
@@ -32,68 +37,277 @@ parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     help='weight decay (default: 5e-4)')
 parser.add_argument('--depth', default=5, type=int,
                     help='Number of conv blocks.')
+parser.add_argument('--img-height', default=128, type=int,
+                    help='Height of resized images')
+parser.add_argument('--img-width', default=128, type=int,
+                    help='width of resized images')
+parser.add_argument('--img-channels', default=3, type=int,
+                    help='Number of channels of images')
 parser.add_argument('--name', default='Unet-5', type=str,
                     help='name of experiment')
+parser.add_argument('--train-path', default='./input/stage1_train/', type=str,
+                    help='Path of raw training data')
+parser.add_argument('--test-path', default='./input/stage1_test/', type=str,
+                    help='Path of raw test data')
+parser.add_argument('--train-data', default='./train.pth.tar', type=str,
+                    help='Path of processed training data')
+parser.add_argument('--val-data', default='./val.pth.tar', type=str,
+                    help='Path of processed validation data')
+parser.add_argument('--test-data', default='./test.pth.tar', type=str,
+                    help='Path of processed test data')
+parser.add_argument('--tensorboard',
+                    help='Log progress to TensorBoard', action='store_false')
+
+
+best_loss = 1
+random.seed(0)
 
 
 def main():
-    global args, best_prec1
+    global args, best_loss
     args = parser.parse_args()
-    if not os.path.exists(TEST_PATH):
-        test = process('./input/stage1_test/', False)
-        t.save(test, TEST_PATH)
-    if not os.path.exists(TRAIN_PATH):
-        train_data = process('./input/stage1_train/')
-        t.save(train_data, TRAIN_PATH)
+
+    if args.tensorboard:
+        print("Using tensorboard")
+        configure("exp/%s" % (args.name))
+
+    if not (os.path.exists(args.train_data) and
+            os.path.exists(args.train_data) and
+            os.path.exists(args.test_data)):
+        train, val, test = DataProcess(args.train_path, args.test_path, 0.9,
+                                       args.img_channels)
+        t.save(train, args.train_data)
+        t.save(val, args.val_data)
+        t.save(test, args.test_data)
 
     s_trans = tsf.Compose([
         tsf.ToPILImage(),
-        tsf.Resize((128, 128)),
+        tsf.Resize((args.img_height, args.img_width)),
         tsf.ToTensor(),
-        tsf.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
     t_trans = tsf.Compose([
         tsf.ToPILImage(),
-        tsf.Resize((128, 128), interpolation=PIL.Image.NEAREST),
+        tsf.Resize((args.img_height, args.img_width),
+                   interpolation=PIL.Image.NEAREST),
         tsf.ToTensor(),
     ])
 
-    trainset = TrainDataset(TRAIN_PATH, s_trans, t_trans)
+    # split the training set into training set and validation set
+    trainset = TrainDataset(args.train_data, s_trans, t_trans)
     trainloader = t.utils.data.DataLoader(
-        trainset, num_workers=2, batch_size=32)
+        trainset, num_workers=1, batch_size=args.batch_size, shuffle=True)
 
-    testset = TestDataset(TEST_PATH, s_trans)
+    valset = TrainDataset(args.val_data, s_trans, t_trans)
+    valloader = t.utils.data.DataLoader(
+        valset, num_workers=1, batch_size=args.batch_size)
+
+    NUM_TRAIN = len(trainset)
+    NUM_VAL = len(valset)
+    NUM_ALL = NUM_TRAIN + NUM_VAL
+    print('Total samples: {0} \n'
+          'Using {1} samples for training, '
+          '{2} samples for validation'.format(NUM_ALL, NUM_TRAIN, NUM_VAL))
+
+    testset = TestDataset(args.test_data, s_trans)
     testloader = t.utils.data.DataLoader(testset, num_workers=1, batch_size=1)
 
-    # Train
-    #model = UNet(1, in_channels=3, depth=args.depth).cuda()
-    model = UNet(3, 1).cuda()
+    # create model
+    model = UNet(1, in_channels=3, depth=args.depth).cuda()
+
+    # get the number of model parameters
+    print('Number of model parameters: {}'.format(
+        sum([p.data.nelement() for p in model.parameters()])))
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = t.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_loss']
+            model.load_state_dict(checkpoint['state_dict'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    # define optimizer
     optimizer = t.optim.Adam(model.parameters(), lr=1e-3)
 
-    for epoch in range(args.epochs):
+    # Train
+    for epoch in range(args.start_epoch, args.epochs):
+        Train(trainloader, model, optimizer, epoch)
+        val_loss = Validate(valloader, model, epoch)
+        is_best = val_loss < best_loss
+        best_loss = min(val_loss, best_loss)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_loss,
+        }, is_best)
+    print 'Best validation loss: ', best_loss
 
-        losses = AverageMeter()
+    # Visualize some predicted masks on training data to get a better intuition
+    # about the performance. Comment it if not necessary.
+    datailer = iter(trainloader)
+    img, mask = datailer.next()
+    torchvision.utils.save_image(img, 'raw.png')
+    torchvision.utils.save_image(mask, 'mask.png')
+    img = t.autograd.Variable(img).cuda()
+    img_pred = model(img)
+    img_pred = img_pred.data
+    torchvision.utils.save_image(img_pred > 0.5, 'predicted.png')
 
-        for i, (x_train, y_train) in enumerate(trainloader):
-            x_train = t.autograd.Variable(x_train).cuda()
-            y_train = t.autograd.Variable(y_train).cuda()
-            optimizer.zero_grad()
-            o = model(x_train)
-            loss = soft_dice_loss(o, y_train)
+    # Load the best model and evaluate on test set
+    checkpoint = t.load('exp/%s/' %
+                        (args.name) + 'model_best.pth.tar')
+    model.load_state_dict(checkpoint['state_dict'])
+    Test(testloader, model)
 
-            losses.update(loss.data[0], args.batch_size)
 
-            loss.backward()
-            optimizer.step()
+def DataProcess(TRAIN_PATH, TEST_PATH, train_prop, channels):
+    # Get train and test IDs
+    train_all_ids = next(os.walk(TRAIN_PATH))[1]
+    # split the training set into train and validation set
+    random.shuffle(train_all_ids)
 
-            if i % args.print_freq == 0:
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-                          epoch, i, len(trainloader), loss=losses))
+    num_all = len(train_all_ids)
+    num_train = int(num_all * train_prop)
+    train_ids = train_all_ids[:num_train]
+    val_ids = train_all_ids[num_train:]
 
-    # Test
-    model = model.eval()
+    test_ids = next(os.walk(TEST_PATH))[1]
+
+    train = []
+    val = []
+    test = []
+
+    print('Getting train images and masks ... ')
+    sys.stdout.flush()
+    for n, id_ in tqdm(enumerate(train_ids), total=len(train_ids)):
+        train_item = {}
+        train_item['name'] = id_
+        path = TRAIN_PATH + id_
+        img = imread(path + '/images/' + id_ + '.png')[:, :, :channels]
+        # img = resize(img, (height, width),
+        #              mode='constant', preserve_range=True)
+
+        train_item['img'] = t.from_numpy(img)
+        mask = None
+        for mask_file in next(os.walk(path + '/masks/'))[2]:
+            mask_ = imread(path + '/masks/' + mask_file)
+            if mask is None:
+                mask = mask_
+            else:
+                mask = np.maximum(mask, mask_)
+        train_item['mask'] = t.from_numpy(mask)
+        train.append(train_item)
+
+    print('Getting validation images and masks ... ')
+    sys.stdout.flush()
+    for n, id_ in tqdm(enumerate(val_ids), total=len(val_ids)):
+        val_item = {}
+        val_item['name'] = id_
+        path = TRAIN_PATH + id_
+        img = imread(path + '/images/' + id_ + '.png')[:, :, :channels]
+        val_item['img'] = t.from_numpy(img)
+        mask = None
+        for mask_file in next(os.walk(path + '/masks/'))[2]:
+            mask_ = imread(path + '/masks/' + mask_file)
+            if mask is None:
+                mask = mask_
+            else:
+                mask = np.maximum(mask, mask_)
+        val_item['mask'] = t.from_numpy(mask)
+        val.append(val_item)
+
+    # Get and resize test images
+    print('Getting test images ... ')
+    sys.stdout.flush()
+    for n, id_ in tqdm(enumerate(test_ids), total=len(test_ids)):
+        test_item = {}
+        test_item['name'] = id_
+        path = TEST_PATH + id_
+        img = imread(path + '/images/' + id_ + '.png')[:, :, :channels]
+        test_item['img'] = t.from_numpy(img)
+        test.append(test_item)
+
+    print('Done!')
+    return train, val, test
+
+
+# Loss definition
+# Use Soft Dice Loss
+def soft_dice_loss(inputs, targets):
+    num = targets.size(0)
+    m1 = inputs.view(num, -1)
+    m2 = targets.view(num, -1)
+    intersection = (m1 * m2)
+    score = 2. * (intersection.sum(1) + 1) / (m1.sum(1) + m2.sum(1) + 1)
+    score = 1 - score.sum() / num
+    return score
+
+
+def Train(trainloader, model, optimizer, epoch):
+    """Train for one epoch on the training set"""
+    losses = AverageMeter()
+
+    for i, (x_train, y_train) in enumerate(trainloader):
+        x_train = t.autograd.Variable(x_train.cuda())
+        y_train = t.autograd.Variable(y_train.cuda(async=True))
+
+        optimizer.zero_grad()
+        o = model(x_train)
+        loss = soft_dice_loss(o, y_train)
+
+        losses.update(loss.data[0], args.batch_size)
+
+        loss.backward()
+        optimizer.step()
+
+        if i % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                      epoch, i, len(trainloader), loss=losses))
+
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('train_loss', losses.avg, epoch)
+
+
+def Validate(validateloader, model, epoch):
+    """Perform validation on the validation set"""
+    losses = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    for i, (x_val, mask) in enumerate(validateloader):
+        mask = mask.cuda(async=True)
+        x_val = x_val.cuda()
+        x_val = t.autograd.Variable(x_val, volatile=True)
+        mask = t.autograd.Variable(mask, volatile=True)
+        output = model(x_val)
+        loss = soft_dice_loss(output, mask)
+
+        losses.update(loss.data[0], args.batch_size)
+
+        if i % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Val Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                      epoch, i, len(validateloader), loss=losses))
+
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('val_loss', losses.avg, epoch)
+
+    return losses.avg
+
+
+def Test(testloader, model):
+    """Evaluate on the test set and save run-length encoding results to disk"""
+    model.eval()
     predictions = []
     test_ids = []
 
@@ -123,57 +337,6 @@ def main():
         os.makedirs(directory)
     csvname = directory + "sub-dsbowl2018.csv"
     sub.to_csv(csvname, index=False)
-
-
-# Preprocess data and save it to disk
-def process(file_path, has_mask=True):
-    file_path = Path(file_path)
-    files = sorted(list(Path(file_path).iterdir()))
-    datas = []
-
-    for file in tqdm(files):
-        item = {}
-        imgs = []
-        for image in (file / 'images').iterdir():
-            img = io.imread(image)
-            imgs.append(img)
-        assert len(imgs) == 1
-        if img.shape[2] > 3:
-            assert(img[:, :, 3] != 255).sum() == 0
-        img = img[:, :, :3]
-
-        if has_mask:
-            mask_files = list((file / 'masks').iterdir())
-            masks = None
-            for ii, mask in enumerate(mask_files):
-                mask = io.imread(mask)
-                assert (mask[(mask != 0)] == 255).all()
-                if masks is None:
-                    H, W = mask.shape
-                    masks = np.zeros((len(mask_files), H, W))
-                masks[ii] = mask
-            tmp_mask = masks.sum(0)
-            assert (tmp_mask[tmp_mask != 0] == 255).all()
-            for ii, mask in enumerate(masks):
-                masks[ii] = mask / 255 * (ii + 1)
-            mask = masks.sum(0)
-            item['mask'] = t.from_numpy(mask)
-        item['name'] = str(file).split('/')[-1]
-        item['img'] = t.from_numpy(img)
-        datas.append(item)
-    return datas
-
-
-# Loss definition
-# Use Soft Dice Loss
-def soft_dice_loss(inputs, targets):
-    num = targets.size(0)
-    m1 = inputs.view(num, -1)
-    m2 = targets.view(num, -1)
-    intersection = (m1 * m2)
-    score = 2. * (intersection.sum(1) + 1) / (m1.sum(1) + m2.sum(1) + 1)
-    score = 1 - score.sum() / num
-    return score
 
 
 # run length encoding
@@ -217,7 +380,7 @@ class TrainDataset():
     def __getitem__(self, index):
         data = self.datas[index]
         img = data['img'].numpy()
-        mask = data['mask'][:, :, None].byte().numpy()
+        mask = data['mask'][:, :, None].numpy()
 
         img = self.s_transform(img)
         mask = self.t_transform(mask)
@@ -225,6 +388,24 @@ class TrainDataset():
 
     def __len__(self):
         return len(self.datas)
+
+
+# class ChunkSampler(sampler.Sampler):
+#     """Samples elements sequentially from some offset.
+#     Arguments:
+#         num_samples: # of desired datapoints
+#         start: offset where we should start selecting from
+#     """
+
+#     def __init__(self, num_samples, start=0):
+#         self.num_samples = num_samples
+#         self.start = start
+
+#     def __iter__(self):
+#         return iter(range(self.start, self.start + self.num_samples))
+
+#     def __len__(self):
+#         return self.num_samples
 
 
 class TestDataset():
