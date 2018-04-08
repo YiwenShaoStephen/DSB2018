@@ -2,6 +2,7 @@ import sys
 import argparse
 import os
 import shutil
+import time
 import torchvision
 import random
 import PIL
@@ -252,7 +253,9 @@ def soft_dice_loss(inputs, targets):
 def Train(trainloader, model, optimizer, epoch):
     """Train for one epoch on the training set"""
     losses = AverageMeter()
+    batch_time = AverageMeter()
 
+    end = time.time()
     for i, (x_train, y_train) in enumerate(trainloader):
         x_train = t.autograd.Variable(x_train.cuda())
         y_train = t.autograd.Variable(y_train.cuda(async=True))
@@ -266,10 +269,16 @@ def Train(trainloader, model, optimizer, epoch):
         loss.backward()
         optimizer.step()
 
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-                      epoch, i, len(trainloader), loss=losses))
+                      epoch, i, len(trainloader), batch_time=batch_time,
+                      loss=losses))
 
     # log to TensorBoard
     if args.tensorboard:
@@ -294,7 +303,7 @@ def Validate(validateloader, model, epoch):
         losses.update(loss.data[0], args.batch_size)
 
         if i % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
+            print('Val: [{0}][{1}/{2}]\t'
                   'Val Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
                       epoch, i, len(validateloader), loss=losses))
 
